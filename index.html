@@ -53,9 +53,9 @@
   <div id="modal">
     <div class="modal-box">
       <h2>Join Group Chat</h2>
-      <p>Enter your display name. It will be locked to this device!</p>
+      <p>Enter your display name to start chatting securely.</p>
       <input type="text" id="usernameInput" placeholder="e.g. Alex" maxlength="20" autofocus>
-      <button onclick="saveAndJoin()">Enter Room</button>
+      <button onclick="joinChat()">Enter Room</button>
     </div>
   </div>
 
@@ -86,49 +86,16 @@
     document.getElementById('roomBadge').textContent = '#' + hashKey;
 
     const myClientId = Math.random().toString(36).substring(2, 9);
-    let username = '';
+    let username = 'Anonymous';
     let cryptoKey = null;
     let mqttClient = null;
     
     let localChatHistory = [];
+    let hasLoadedHistory = false;
     let hasAnnouncedJoin = false;
     let lastSystemMessageText = '';
 
-    // Storage keys unique to this room
-    const USER_KEY = `locked_username_${hashKey}`;
-    const HISTORY_KEY = `chat_history_${hashKey}`;
-
-    // Auto-login if username is already locked in local storage
-    window.addEventListener('DOMContentLoaded', () => {
-      // 1. Load saved chat history directly from device memory
-      const savedHistory = localStorage.getItem(HISTORY_KEY);
-      if (savedHistory) {
-        try {
-          localChatHistory = JSON.parse(savedHistory);
-          localChatHistory.forEach(msg => renderMessage(msg, false));
-        } catch (e) { console.error("Could not parse saved history", e); }
-      }
-
-      // 2. Auto-detect locked username
-      const lockedName = localStorage.getItem(USER_KEY);
-      if (lockedName) {
-        username = lockedName;
-        document.getElementById('modal').style.display = 'none';
-        startChatSession();
-      }
-    });
-
-    function saveAndJoin() {
-      const nameInput = document.getElementById('usernameInput').value.trim();
-      if (!nameInput) return alert('Please enter a username!');
-      username = nameInput;
-      
-      // Lock username permanently to browser memory
-      localStorage.setItem(USER_KEY, username);
-      document.getElementById('modal').style.display = 'none';
-      startChatSession();
-    }
-
+    // Derive AES-256 encryption key from URL Hash
     async function initCryptoKey(secret) {
       const enc = new TextEncoder();
       const keyMaterial = await crypto.subtle.digest('SHA-256', enc.encode(secret));
@@ -159,7 +126,12 @@
       }
     }
 
-    async function startChatSession() {
+    async function joinChat() {
+      const nameInput = document.getElementById('usernameInput').value.trim();
+      if (!nameInput) return alert('Please enter a username!');
+      username = nameInput;
+      document.getElementById('modal').style.display = 'none';
+
       cryptoKey = await initCryptoKey(hashKey);
       const topic = `e2ee-webchat-v1/${hashKey}`;
 
@@ -171,6 +143,7 @@
       mqttClient.on('connect', async () => {
         mqttClient.subscribe(topic);
 
+        // Send "Joined" message ONLY ONCE per session to stop reconnect spam on mobile Chrome
         if (!hasAnnouncedJoin) {
           hasAnnouncedJoin = true;
           const nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -182,12 +155,14 @@
           });
         }
 
-        // Request history from online friends
+        // Request chat history from online peers
         await broadcastPayload({
           sender: username,
           type: 'history_request',
           requesterId: myClientId
         });
+
+        setTimeout(() => { hasLoadedHistory = true; }, 1500);
       });
 
       mqttClient.on('message', async (t, message) => {
@@ -198,58 +173,31 @@
     }
 
     async function handleIncomingMessage(msg) {
-      // Send history when a new member joins
       if (msg.type === 'history_request') {
         if (msg.requesterId !== myClientId && localChatHistory.length > 0) {
-          // Filter out heavy images from history packet so MQTT broker doesn't drop it
-          const syncHistory = localChatHistory.slice(-25).map(item => {
-            if (item.type === 'image' || item.type === 'video') {
-              return { ...item, content: '[Shared Media]' };
-            }
-            return item;
-          });
-
           await broadcastPayload({
             type: 'history_response',
-            targetId: myClientId,
-            history: syncHistory
+            targetId: msg.requesterId,
+            history: localChatHistory
           });
         }
         return;
       }
 
-      // Receive history response from active members
       if (msg.type === 'history_response') {
-        if (msg.targetId === myClientId) {
-          msg.history.forEach(item => {
-            // Add missing history items
-            const exists = localChatHistory.some(h => h.time === item.time && h.sender === item.sender && h.content === item.content);
-            if (!exists) {
-              localChatHistory.push(item);
-              renderMessage(item, true);
-            }
-          });
-          saveHistoryToStorage();
+        if (msg.targetId === myClientId && !hasLoadedHistory) {
+          hasLoadedHistory = true;
+          localChatHistory = msg.history;
+          document.getElementById('messagesArea').innerHTML = '';
+          localChatHistory.forEach(item => renderMessage(item, false));
         }
         return;
       }
 
-      // Save normal messages
       localChatHistory.push(msg);
-      if (localChatHistory.length > 80) localChatHistory.shift();
-      saveHistoryToStorage();
+      if (localChatHistory.length > 100) localChatHistory.shift();
 
       renderMessage(msg, true);
-    }
-
-    function saveHistoryToStorage() {
-      try {
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(localChatHistory));
-      } catch (e) {
-        // If localStorage storage is full, strip media files and re-save
-        const lightweight = localChatHistory.slice(-30).map(i => (i.type === 'image' ? {...i, content: ''} : i));
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(lightweight));
-      }
     }
 
     async function sendMessage() {
@@ -268,7 +216,8 @@
       await broadcastPayload(payload);
     }
 
-    function compressImage(file, maxWidth = 900, maxHeight = 900, quality = 0.6) {
+    // Canvas Compression function to resize images before sending
+    function compressImage(file, maxWidth = 1000, maxHeight = 1000, quality = 0.65) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.readAsDataURL(file);
@@ -310,6 +259,7 @@
 
       const nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+      // Handle Photos with automatic canvas compression
       if (file.type.startsWith('image/')) {
         try {
           const compressedDataUrl = await compressImage(file);
@@ -321,11 +271,13 @@
           };
           await broadcastPayload(payload);
         } catch (err) {
-          alert("Could not process image.");
+          alert("Could not process image. Please try another photo.");
         }
-      } else if (file.type.startsWith('video/')) {
+      } 
+      // Handle Videos (max 2MB limit)
+      else if (file.type.startsWith('video/')) {
         if (file.size > 2 * 1024 * 1024) {
-          return alert("Video file is too large! Please choose a clip under 2MB.");
+          return alert("Video file is too large! Please choose a short clip under 2MB.");
         }
         const reader = new FileReader();
         reader.onload = async function(e) {
@@ -352,8 +304,11 @@
     function renderMessage(msg, shouldScroll = true) {
       const container = document.getElementById('messagesArea');
 
+      // Handle Presence Notifications
       if (msg.type === 'presence') {
         const sysText = `${msg.sender} ${msg.action === 'join' ? 'joined' : 'left'}`;
+        
+        // Block duplicate consecutive presence alerts
         if (lastSystemMessageText === sysText) return;
         lastSystemMessageText = sysText;
 
@@ -366,6 +321,7 @@
         return;
       }
 
+      // Reset last system message check when a real text/media arrives
       lastSystemMessageText = '';
 
       const msgDiv = document.createElement('div');
@@ -376,13 +332,9 @@
       if (msg.type === 'text') {
         contentHtml = `<div>${escapeHtml(msg.content)}</div>`;
       } else if (msg.type === 'image') {
-        contentHtml = msg.content === '[Shared Media]' 
-          ? `<div style="font-style:italic; opacity:0.8;">📷 [Photo]</div>`
-          : `<img src="${msg.content}" class="chat-media" alt="Shared Photo"/>`;
+        contentHtml = `<img src="${msg.content}" class="chat-media" alt="Shared Photo"/>`;
       } else if (msg.type === 'video') {
-        contentHtml = msg.content === '[Shared Media]'
-          ? `<div style="font-style:italic; opacity:0.8;">🎥 [Video]</div>`
-          : `<video src="${msg.content}" controls class="chat-media"></video>`;
+        contentHtml = `<video src="${msg.content}" controls class="chat-media"></video>`;
       }
 
       msgDiv.innerHTML = `
