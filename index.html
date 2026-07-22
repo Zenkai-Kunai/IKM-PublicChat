@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>E2EE Public Group Chat</title>
-  <!-- Public MQTT library for real-time WebSocket messaging -->
   <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -36,6 +35,7 @@
     .sender-name { font-size: 0.75rem; font-weight: bold; margin-bottom: 0.25rem; color: #7dd3fc; }
     .time-stamp { font-size: 0.65rem; text-align: right; opacity: 0.7; margin-top: 0.3rem; }
     
+    .system-msg { align-self: center; background: #0f172a; color: #94a3b8; font-size: 0.75rem; padding: 0.3rem 0.8rem; border-radius: 12px; border: 1px solid #334155; margin: 0.2rem 0; }
     .chat-media { max-width: 100%; max-height: 250px; border-radius: 8px; margin-top: 0.5rem; display: block; object-fit: cover; }
 
     /* Footer / Input Bar */
@@ -82,25 +82,28 @@
   </div>
 
   <script>
-    // Get room secret key from URL Hash (e.g. index.html#my-secret-room)
     const hashKey = window.location.hash.substring(1) || 'default-group-room';
     document.getElementById('roomBadge').textContent = '#' + hashKey;
 
+    const myClientId = Math.random().toString(36).substring(2, 9);
     let username = 'Anonymous';
     let cryptoKey = null;
     let mqttClient = null;
+    
+    // In-memory chat log stored locally in browser
+    let localChatHistory = [];
+    let hasLoadedHistory = false;
 
-    // Derive an AES-256 encryption key from the URL Room Secret
+    // Derive AES-256 encryption key from URL Hash
     async function initCryptoKey(secret) {
       const enc = new TextEncoder();
       const keyMaterial = await crypto.subtle.digest('SHA-256', enc.encode(secret));
       return crypto.subtle.importKey('raw', keyMaterial, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
     }
 
-    // Encrypt JSON object to Base64 Ciphertext using AES-GCM
     async function encryptPayload(dataObj) {
       const enc = new TextEncoder();
-      const iv = crypto.getRandomValues(new Uint8Array(12)); // 12-byte IV for AES-GCM
+      const iv = crypto.getRandomValues(new Uint8Array(12));
       const jsonStr = JSON.stringify(dataObj);
       const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, enc.encode(jsonStr));
       
@@ -110,7 +113,6 @@
       });
     }
 
-    // Decrypt Ciphertext back to JSON object
     async function decryptPayload(payloadStr) {
       try {
         const payload = JSON.parse(payloadStr);
@@ -119,7 +121,6 @@
         const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, data);
         return JSON.parse(new TextDecoder().decode(decrypted));
       } catch (e) {
-        console.error("Decryption failed. Someone might be using a different room key.", e);
         return null;
       }
     }
@@ -130,24 +131,89 @@
       username = nameInput;
       document.getElementById('modal').style.display = 'none';
 
-      // Initialize browser encryption key
       cryptoKey = await initCryptoKey(hashKey);
 
-      // Connect to HiveMQ public SSL WebSocket broker
-      mqttClient = mqtt.connect('wss://broker.hivemq.com:8884/mqtt');
       const topic = `e2ee-webchat-v1/${hashKey}`;
+      const nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-      mqttClient.on('connect', () => {
+      // Build MQTT Last Will & Testament payload for sudden disconnects
+      const leavePayload = await encryptPayload({
+        sender: username,
+        type: 'presence',
+        action: 'leave',
+        time: nowTime
+      });
+
+      // Connect with Last Will setup
+      mqttClient = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', {
+        will: { topic: topic, payload: leavePayload, qos: 0, retain: false }
+      });
+
+      mqttClient.on('connect', async () => {
         mqttClient.subscribe(topic);
-        appendSystemMessage(`Joined encrypted room. Share this full browser link with your friends!`);
+
+        // 1. Send Join Notification
+        await broadcastPayload({
+          sender: username,
+          type: 'presence',
+          action: 'join',
+          time: nowTime
+        });
+
+        // 2. Request chat history from active online peers
+        await broadcastPayload({
+          sender: username,
+          type: 'history_request',
+          requesterId: myClientId
+        });
+
+        // Fallback: If no online peers respond in 1.5 seconds, set history as ready
+        setTimeout(() => {
+          hasLoadedHistory = true;
+        }, 1500);
       });
 
       mqttClient.on('message', async (t, message) => {
         const decrypted = await decryptPayload(message.toString());
-        if (decrypted) {
-          renderMessage(decrypted);
-        }
+        if (!decrypted) return;
+
+        handleIncomingMessage(decrypted);
       });
+    }
+
+    async function handleIncomingMessage(msg) {
+      // Handle History Syncing
+      if (msg.type === 'history_request') {
+        // If another peer asks for history and I have messages, send them my chat log
+        if (msg.requesterId !== myClientId && localChatHistory.length > 0) {
+          await broadcastPayload({
+            type: 'history_response',
+            targetId: msg.requesterId,
+            history: localChatHistory
+          });
+        }
+        return;
+      }
+
+      if (msg.type === 'history_response') {
+        // If history response is for me and I haven't synced yet
+        if (msg.targetId === myClientId && !hasLoadedHistory) {
+          hasLoadedHistory = true;
+          localChatHistory = msg.history;
+          
+          // Re-render full chat history
+          document.getElementById('messagesArea').innerHTML = '';
+          localChatHistory.forEach(item => renderMessage(item, false));
+        }
+        return;
+      }
+
+      // Record message into local memory log
+      localChatHistory.push(msg);
+      // Keep local history capped at last 100 items to prevent lag
+      if (localChatHistory.length > 100) localChatHistory.shift();
+
+      renderMessage(msg, true);
     }
 
     async function sendMessage() {
@@ -170,9 +236,8 @@
       const file = event.target.files[0];
       if (!file) return;
 
-      // Keep media under 2.5MB so WebSockets can transmit smoothly
       if (file.size > 2.5 * 1024 * 1024) {
-        return alert("File is too large! Please select a photo or short video clip under 2.5MB.");
+        return alert("File too large! Choose a photo/video under 2.5MB.");
       }
 
       const reader = new FileReader();
@@ -196,11 +261,22 @@
       mqttClient.publish(topic, encrypted);
     }
 
-    function renderMessage(msg) {
+    function renderMessage(msg, shouldScroll = true) {
       const container = document.getElementById('messagesArea');
+
+      // Handle Presence Notifications (Join / Leave)
+      if (msg.type === 'presence') {
+        const sysDiv = document.createElement('div');
+        sysDiv.className = 'system-msg';
+        const icon = msg.action === 'join' ? '🟢' : '🔴';
+        sysDiv.textContent = `${icon} ${msg.sender} ${msg.action === 'join' ? 'joined' : 'left'} the chat at ${msg.time}`;
+        container.appendChild(sysDiv);
+        if (shouldScroll) container.scrollTop = container.scrollHeight;
+        return;
+      }
+
       const msgDiv = document.createElement('div');
       const isMine = msg.sender === username;
-
       msgDiv.className = `message ${isMine ? 'mine' : 'others'}`;
 
       let contentHtml = '';
@@ -219,15 +295,7 @@
       `;
 
       container.appendChild(msgDiv);
-      container.scrollTop = container.scrollHeight;
-    }
-
-    function appendSystemMessage(text) {
-      const container = document.getElementById('messagesArea');
-      const sysDiv = document.createElement('div');
-      sysDiv.style.cssText = 'text-align:center; color:#64748b; font-size:0.8rem; margin:0.5rem 0;';
-      sysDiv.textContent = text;
-      container.appendChild(sysDiv);
+      if (shouldScroll) container.scrollTop = container.scrollHeight;
     }
 
     function escapeHtml(str) {
