@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>E2EE Public Group Chat</title>
+  <!-- Public MQTT library for real-time WebSocket messaging -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    body { background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; height: 100vh; }
+    
+    /* Username Input Modal */
+    #modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; justify-content: center; align-items: center; z-index: 100; }
+    .modal-box { background: #1e293b; padding: 2rem; border-radius: 16px; width: 90%; max-width: 380px; text-align: center; border: 1px solid #334155; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }
+    .modal-box h2 { margin-bottom: 0.5rem; color: #38bdf8; }
+    .modal-box p { font-size: 0.85rem; color: #94a3b8; margin-bottom: 1.25rem; }
+    .modal-box input { width: 100%; padding: 0.75rem 1rem; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: white; margin-bottom: 1rem; outline: none; font-size: 1rem; }
+    .modal-box button { width: 100%; padding: 0.75rem; border-radius: 8px; border: none; background: #0284c7; color: white; font-weight: bold; font-size: 1rem; cursor: pointer; transition: background 0.2s; }
+    .modal-box button:hover { background: #0369a1; }
+
+    /* Chat App Interface */
+    .chat-container { width: 100%; max-width: 650px; height: 100vh; display: flex; flex-direction: column; background: #1e293b; border-left: 1px solid #334155; border-right: 1px solid #334155; }
+    
+    /* Header */
+    .chat-header { padding: 1rem; background: #0f172a; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
+    .room-title { display: flex; flex-direction: column; }
+    .e2e-tag { color: #22c55e; font-size: 0.75rem; margin-top: 2px; }
+    .room-badge { background: #0369a1; padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
+
+    /* Messages Stream */
+    .messages-area { flex: 1; padding: 1rem; overflow-y: auto; display: flex; flex-direction: column; gap: 0.75rem; }
+    .message { max-width: 80%; padding: 0.65rem 0.9rem; border-radius: 12px; font-size: 0.95rem; word-break: break-word; }
+    .message.mine { align-self: flex-end; background: #0284c7; color: white; border-bottom-right-radius: 2px; }
+    .message.others { align-self: flex-start; background: #334155; color: #f8fafc; border-bottom-left-radius: 2px; }
+    .sender-name { font-size: 0.75rem; font-weight: bold; margin-bottom: 0.25rem; color: #7dd3fc; }
+    .time-stamp { font-size: 0.65rem; text-align: right; opacity: 0.7; margin-top: 0.3rem; }
+    
+    .chat-media { max-width: 100%; max-height: 250px; border-radius: 8px; margin-top: 0.5rem; display: block; object-fit: cover; }
+
+    /* Footer / Input Bar */
+    .chat-input-container { padding: 0.75rem 1rem; background: #0f172a; border-top: 1px solid #334155; display: flex; gap: 0.5rem; align-items: center; }
+    .chat-input-container input[type="text"] { flex: 1; padding: 0.75rem 1rem; border-radius: 24px; border: 1px solid #475569; background: #1e293b; color: white; outline: none; font-size: 0.95rem; }
+    .icon-btn { cursor: pointer; padding: 0.6rem; background: #334155; border-radius: 50%; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; user-select: none; transition: background 0.2s; }
+    .icon-btn:hover { background: #475569; }
+    .send-btn { padding: 0.6rem 1.2rem; border: none; background: #22c55e; color: white; font-weight: bold; border-radius: 24px; cursor: pointer; font-size: 0.95rem; transition: background 0.2s; }
+    .send-btn:hover { background: #16a34a; }
+  </style>
+</head>
+<body>
+
+  <!-- Username Entry Modal -->
+  <div id="modal">
+    <div class="modal-box">
+      <h2>Join Group Chat</h2>
+      <p>Enter your display name to start chatting securely.</p>
+      <input type="text" id="usernameInput" placeholder="e.g. Alex" maxlength="20" autofocus>
+      <button onclick="joinChat()">Enter Room</button>
+    </div>
+  </div>
+
+  <!-- Chat UI -->
+  <div class="chat-container">
+    <div class="chat-header">
+      <div class="room-title">
+        <h3>Public Group</h3>
+        <span class="e2e-tag">🔒 End-to-End Encrypted</span>
+      </div>
+      <span class="room-badge" id="roomBadge">Room: General</span>
+    </div>
+
+    <div class="messages-area" id="messagesArea"></div>
+
+    <div class="chat-input-container">
+      <label class="icon-btn" title="Send Photo or Video">
+        📷
+        <input type="file" id="fileInput" accept="image/*,video/*" style="display:none;" onchange="handleFileUpload(event)">
+      </label>
+      <input type="text" id="messageInput" placeholder="Type a message..." onkeydown="if(event.key==='Enter') sendMessage()">
+      <button class="send-btn" onclick="sendMessage()">Send</button>
+    </div>
+  </div>
+
+  <script>
+    // Get room secret key from URL Hash (e.g. index.html#my-secret-room)
+    const hashKey = window.location.hash.substring(1) || 'default-group-room';
+    document.getElementById('roomBadge').textContent = '#' + hashKey;
+
+    let username = 'Anonymous';
+    let cryptoKey = null;
+    let mqttClient = null;
+
+    // Derive an AES-256 encryption key from the URL Room Secret
+    async function initCryptoKey(secret) {
+      const enc = new TextEncoder();
+      const keyMaterial = await crypto.subtle.digest('SHA-256', enc.encode(secret));
+      return crypto.subtle.importKey('raw', keyMaterial, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+    }
+
+    // Encrypt JSON object to Base64 Ciphertext using AES-GCM
+    async function encryptPayload(dataObj) {
+      const enc = new TextEncoder();
+      const iv = crypto.getRandomValues(new Uint8Array(12)); // 12-byte IV for AES-GCM
+      const jsonStr = JSON.stringify(dataObj);
+      const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, enc.encode(jsonStr));
+      
+      return JSON.stringify({
+        iv: Array.from(iv),
+        data: Array.from(new Uint8Array(encrypted))
+      });
+    }
+
+    // Decrypt Ciphertext back to JSON object
+    async function decryptPayload(payloadStr) {
+      try {
+        const payload = JSON.parse(payloadStr);
+        const iv = new Uint8Array(payload.iv);
+        const data = new Uint8Array(payload.data);
+        const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, data);
+        return JSON.parse(new TextDecoder().decode(decrypted));
+      } catch (e) {
+        console.error("Decryption failed. Someone might be using a different room key.", e);
+        return null;
+      }
+    }
+
+    async function joinChat() {
+      const nameInput = document.getElementById('usernameInput').value.trim();
+      if (!nameInput) return alert('Please enter a username!');
+      username = nameInput;
+      document.getElementById('modal').style.display = 'none';
+
+      // Initialize browser encryption key
+      cryptoKey = await initCryptoKey(hashKey);
+
+      // Connect to HiveMQ public SSL WebSocket broker
+      mqttClient = mqtt.connect('wss://broker.hivemq.com:8884/mqtt');
+      const topic = `e2ee-webchat-v1/${hashKey}`;
+
+      mqttClient.on('connect', () => {
+        mqttClient.subscribe(topic);
+        appendSystemMessage(`Joined encrypted room. Share this full browser link with your friends!`);
+      });
+
+      mqttClient.on('message', async (t, message) => {
+        const decrypted = await decryptPayload(message.toString());
+        if (decrypted) {
+          renderMessage(decrypted);
+        }
+      });
+    }
+
+    async function sendMessage() {
+      const input = document.getElementById('messageInput');
+      const text = input.value.trim();
+      if (!text) return;
+
+      const payload = {
+        sender: username,
+        type: 'text',
+        content: text,
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      };
+
+      input.value = '';
+      await broadcastPayload(payload);
+    }
+
+    async function handleFileUpload(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      // Keep media under 2.5MB so WebSockets can transmit smoothly
+      if (file.size > 2.5 * 1024 * 1024) {
+        return alert("File is too large! Please select a photo or short video clip under 2.5MB.");
+      }
+
+      const reader = new FileReader();
+      reader.onload = async function(e) {
+        const isVideo = file.type.startsWith('video/');
+        const payload = {
+          sender: username,
+          type: isVideo ? 'video' : 'image',
+          content: e.target.result,
+          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        };
+        await broadcastPayload(payload);
+      };
+      reader.readAsDataURL(file);
+      event.target.value = '';
+    }
+
+    async function broadcastPayload(payload) {
+      const encrypted = await encryptPayload(payload);
+      const topic = `e2ee-webchat-v1/${hashKey}`;
+      mqttClient.publish(topic, encrypted);
+    }
+
+    function renderMessage(msg) {
+      const container = document.getElementById('messagesArea');
+      const msgDiv = document.createElement('div');
+      const isMine = msg.sender === username;
+
+      msgDiv.className = `message ${isMine ? 'mine' : 'others'}`;
+
+      let contentHtml = '';
+      if (msg.type === 'text') {
+        contentHtml = `<div>${escapeHtml(msg.content)}</div>`;
+      } else if (msg.type === 'image') {
+        contentHtml = `<img src="${msg.content}" class="chat-media" alt="Shared Photo"/>`;
+      } else if (msg.type === 'video') {
+        contentHtml = `<video src="${msg.content}" controls class="chat-media"></video>`;
+      }
+
+      msgDiv.innerHTML = `
+        <div class="sender-name">${escapeHtml(msg.sender)}</div>
+        ${contentHtml}
+        <div class="time-stamp">${msg.time}</div>
+      `;
+
+      container.appendChild(msgDiv);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function appendSystemMessage(text) {
+      const container = document.getElementById('messagesArea');
+      const sysDiv = document.createElement('div');
+      sysDiv.style.cssText = 'text-align:center; color:#64748b; font-size:0.8rem; margin:0.5rem 0;';
+      sysDiv.textContent = text;
+      container.appendChild(sysDiv);
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+  </script>
+</body>
+</html>
